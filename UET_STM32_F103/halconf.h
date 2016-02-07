@@ -239,6 +239,28 @@
 #define MMC_NICE_WAITING            TRUE
 #endif
 
+/**
+ * @brief   Number of positive insertion queries before generating the
+ *          insertion event.
+ */
+#if !defined(MMC_POLLING_INTERVAL) || defined(__DOXYGEN__)
+#define MMC_POLLING_INTERVAL        10
+#endif
+
+/**
+ * @brief   Interval, in milliseconds, between insertion queries.
+ */
+#if !defined(MMC_POLLING_DELAY) || defined(__DOXYGEN__)
+#define MMC_POLLING_DELAY           10
+#endif
+
+/**
+ * @brief   Block size for MMC transfers.
+ */
+#if !defined(MMC_SECTOR_SIZE) || defined(__DOXYGEN__)
+#define MMC_SECTOR_SIZE             512
+#endif
+
 /*===========================================================================*/
 /* SDC driver related settings.                                              */
 /*===========================================================================*/
@@ -326,11 +348,8 @@
  * @note    Disabling this option saves both code and data space.
  */
 #if !defined(SPI_USE_MUTUAL_EXCLUSION) || defined(__DOXYGEN__)
-#define SPI_USE_MUTUAL_EXCLUSION    FALSE
+#define SPI_USE_MUTUAL_EXCLUSION    TRUE
 #endif
-
-#define DAC_USE_WAIT				FALSE
-#define DAC_USE_MUTUAL_EXCLUSION	FALSE
 
 #endif /* _HALCONF_H_ */
 

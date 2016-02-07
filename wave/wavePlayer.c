@@ -6,15 +6,17 @@
 #include "hal.h"
 
 #include "ff.h"
-#include "chprintf.h"
 #include "wavePlayer.h"
 #include "codec_DAC.h"
 #include <string.h>
-#include "drivers.h"
 
-#define DEBUG	1
+#define PLAYER_PRIO		(NORMALPRIO+1)
+#define HEADERMAX		128
+#define DEBUG			FALSE
+
 #if DEBUG
-#define CONSOLE	SD2
+#define CONSOLE	SD1
+#include "chprintf.h"
 #endif
 
 #define FORMAT_PCM		1
@@ -22,7 +24,6 @@
 #define WAVE			0x45564157		// 'WAVE' in Little-Endian
 #define DATA			0x61746164		// 'data' in Little-Endian
 #define FMT				0x20746D66		// 'fmt ' in Little-Endian
-#define EXTRA_LEN		2				// length of extraBytes field
 
 typedef struct _chunk
 {
@@ -45,123 +46,125 @@ typedef struct _WAVEHeader
      uint32_t    byteRate;		// byteRate = SampleRate * BlockAlign
      uint16_t    blockAlign;	// BlockAlign = bitsPerSample / 8 * NumChannels
      uint16_t    bitsPerSample;
-     // in some case there may be uint16_t extraBytes
 } WAVEHeader;
 
 typedef struct _DATAHeader
 {
-		chunk       descriptor;
+	chunk       descriptor;
 } DATAHeader;
 
 typedef struct _FILEHeader
 {
-     RIFFHeader  riff;
-     WAVEHeader  wave;
-     DATAHeader  data;
+    RIFFHeader  riff;
+    WAVEHeader  wave;
 } FILEHeader;
 
-static uint8_t HeaderLength = sizeof(FILEHeader);
+extern bool fs_ready;
+static dacsample_t dacbuffer[DAC_BUFFER_SIZE];
 
-EventSource player_evsrc;
-Thread* playerThread;
+uint8_t bitsPerSample;
+uint16_t sampleRate;
+uint32_t bytesToPlay;
 
-static uint8_t bitsPerSample;
-static uint32_t bytesToPlay;
-static uint8_t buffer[DAC_BUFFER_SIZE] = {0};
+thread_t* playerThread;
+static FIL file;
 
-static FIL f;
-
-static void i16_conv(uint16_t *buffer, uint16_t len) {
-	static uint16_t i;
-	for (i=0; i<len/2; i++) {
-		buffer[i] += 0x8000;
+static void i16_conv(uint16_t buf[], uint16_t len) {
+	for (uint16_t i=0; i<len; i++) {
+		buf[i] += 0x8000;
 	}
 }
 
-static WORKING_AREA(waPlayerThread, 256);
-static msg_t wavePlayerThread(void *arg) {
+static THD_WORKING_AREA(waPlayerThread, 512);
+static THD_FUNCTION(wavePlayerThread, arg) {
 	(void) arg;
-	chRegSetThreadName("playerThd");
 
-	static UINT btr;
-	static uint8_t err;
-	struct EventListener player_el;
-	static void *pbuffer;
+	UINT btr;
+	FRESULT err;
+	void *pbuffer;
 
-	pbuffer = buffer;
-	memset(pbuffer, 0, DAC_BUFFER_SIZE);
-	err = f_read(&f, pbuffer, DAC_BUFFER_SIZE, &btr);
-	if (err) return 1;
+	chRegSetThreadName("player");
 
-	chEvtInit(&player_evsrc);
-	chEvtRegister(&player_evsrc, &player_el, 0);
+	pbuffer = dacbuffer;
+	memset(pbuffer, 0, DAC_BUFFER_SIZE * sizeof(dacsample_t));
+	err = f_read(&file, pbuffer, DAC_BUFFER_SIZE * sizeof(dacsample_t), &btr);
+	if (err != FR_OK) goto end;
 
 	if (bitsPerSample == 16) {
-		i16_conv((uint16_t*)pbuffer, DAC_BUFFER_SIZE);
-		codec_audio_send(pbuffer, DAC_BUFFER_SIZE/2);
+		i16_conv((uint16_t*) pbuffer, DAC_BUFFER_SIZE);
+		codec_audio_send(sampleRate, pbuffer, DAC_BUFFER_SIZE);
 	} else {
-		codec_audio_send(pbuffer, DAC_BUFFER_SIZE);
+		codec_audio_send(sampleRate, pbuffer, DAC_BUFFER_SIZE*4);	// don't know why
 	}
+
 	bytesToPlay -= btr;
+
 	while (bytesToPlay) {
-		chEvtWaitAny(EVENT_MASK(0));
+    	if (chThdShouldTerminateX()) break;
+		eventmask_t evt = chEvtWaitAny(ALL_EVENTS);
 
-		chSysLock();
-		flagsmask_t flags = chEvtGetAndClearFlagsI(&player_el);
-		chSysUnlock();
-
-		if (flags & DAC_CB) {
-			memset(pbuffer, 0, DAC_BUFFER_SIZE/2);
-			err = f_read(&f, pbuffer, DAC_BUFFER_SIZE/2, &btr);
+	    if (evt & EVT_DAC_ERR) break;
+	    if (evt & EVT_DAC_TC) {
+			err = f_read(&file, pbuffer, DAC_BUFFER_SIZE, &btr);
+			if (err != FR_OK) break;
+			if (btr < DAC_BUFFER_SIZE)
+				memset(pbuffer+btr, 0, DAC_BUFFER_SIZE-btr);
 			if (bitsPerSample == 16) {
-				i16_conv(pbuffer, DAC_BUFFER_SIZE/2);
+				i16_conv((uint16_t*) pbuffer, DAC_BUFFER_SIZE/2);
 			}
-			if (err) break;
-			if (pbuffer == &buffer[0])
-				pbuffer += DAC_BUFFER_SIZE/2;
+			if (pbuffer == dacbuffer)
+				pbuffer += DAC_BUFFER_SIZE;
 			else
-				pbuffer = buffer;
+				pbuffer = dacbuffer;
 			bytesToPlay -= btr;
 		}
-		if (flags & DAC_ERR) break;
-		if (chThdShouldTerminate())	break;
+
+	    if (!btr) break;
 	}
 
+end:
 	codec_stop();
-	chEvtUnregister(&player_evsrc, &player_el);
+	f_close(&file);
+
 	playerThread = NULL;
-	f_close(&f);
-	return 0;
+	chThdExit((msg_t) 0);
 }
 
 void playFile(char* fpath) {
+	uint16_t HeaderLength;
+	FRESULT err;
+	UINT btr;
 
-	static uint8_t err;
-	static UINT btr;
+	if (!fs_ready) {
+#if DEBUG
+	    chprintf((BaseSequentialStream*) &CONSOLE, "File System not mounted\r\n");
+#endif
+	    return;
+	}
 
 	while (playerThread) {
 		stopPlay();
 		chThdSleepMilliseconds(100);
 	}
 
-	err = f_open(&f, fpath, FA_READ);
-	if (err) {
+	err = f_open(&file, fpath, FA_READ);
+	if (err != FR_OK) {
 #if DEBUG
 		chprintf((BaseSequentialStream*) &CONSOLE, "Failed to open file %s, error=%d\r\n", fpath, err);
 #endif
 		return;
 	}
 
-	err = f_read(&f, &buffer[0], HeaderLength+EXTRA_LEN, &btr);
-	if (err) {
+	HeaderLength = sizeof(FILEHeader);
+	err = f_read(&file, &dacbuffer, HeaderLength, &btr);
+	if (err != FR_OK) {
 #if DEBUG
 		chprintf((BaseSequentialStream*) &CONSOLE, "Error read file %s, error=%d\r\n", fpath, err);
 #endif
 		return;
 	}
 
-	static FILEHeader* header;
-	header = (FILEHeader*)buffer;
+	FILEHeader* header = (FILEHeader*) dacbuffer;
     if (!(header->riff.descriptor.id == RIFF
         && header->riff.type == WAVE
         && header->wave.descriptor.id == FMT
@@ -180,7 +183,7 @@ void playFile(char* fpath) {
 
 	if (header->wave.numChannels > 1) {
 #if DEBUG
-		chprintf((BaseSequentialStream*) &CONSOLE, "Error: only mono audio supported.\r\n");
+		chprintf((BaseSequentialStream*) &CONSOLE, "Error: only mono format supported.\r\n");
 #endif
 		return;
 	}
@@ -192,52 +195,53 @@ void playFile(char* fpath) {
 		return;
 	}
 
-	if (header->wave.sampleRate > 44100) {
+	sampleRate = header->wave.sampleRate;
+	bitsPerSample = header->wave.bitsPerSample;
+
+	DATAHeader* dataheader = (DATAHeader*) &dacbuffer;
+
+	HeaderLength += sizeof(DATAHeader);
+	err = f_read(&file, &dacbuffer, sizeof(DATAHeader), &btr);
+	if (err != FR_OK) {
 #if DEBUG
-		chprintf((BaseSequentialStream*) &CONSOLE, "Error: sample rate %d not supported.\r\n", header->wave.sampleRate);
+		chprintf((BaseSequentialStream*) &CONSOLE, "Error read file %s, error=%d\r\n", fpath, err);
 #endif
 		return;
 	}
 
-	bitsPerSample = header->wave.bitsPerSample;
-	if ((uint32_t) header->data.descriptor.id == DATA)	{
-		bytesToPlay = header->data.descriptor.size;
-		goto play;
+	while ((uint32_t) dataheader->descriptor.id != DATA) {
+		if (HeaderLength > HEADERMAX) break;
+		if (dataheader->descriptor.size > 0) {
+			HeaderLength += dataheader->descriptor.size;
+			f_lseek(&file, HeaderLength);
+		}
+		HeaderLength += sizeof(DATAHeader);
+		err = f_read(&file, &dacbuffer, sizeof(DATAHeader), &btr);
+		if (err != FR_OK) {
+#if DEBUG
+			chprintf((BaseSequentialStream*) &CONSOLE, "Error read file %s, error=%d\r\n", fpath, err);
+#endif
+			return;
+		}
 	}
-	else {
-			static DATAHeader* dataheader;
-			dataheader = (DATAHeader*) &buffer[sizeof(RIFFHeader)+sizeof(WAVEHeader)+EXTRA_LEN];
-			if ((uint32_t) dataheader->descriptor.id == DATA)	{
-				bytesToPlay = dataheader->descriptor.size;
-				HeaderLength += EXTRA_LEN;
-				goto play;
-			}
+
+	if ((uint32_t) dataheader->descriptor.id != DATA) {
 #if DEBUG
 		chprintf((BaseSequentialStream*) &CONSOLE, "Error: %s data chunk not found\r\n", fpath);
 #endif
 		return;
 	}
 
-play:
-
 #if DEBUG
 	chprintf((BaseSequentialStream*) &CONSOLE, "OK, ready to play.\r\n");
 #endif
 
-	codec_init(header->wave.sampleRate, bitsPerSample);
-
+	bytesToPlay = dataheader->descriptor.size;
 #if DEBUG
 	chprintf((BaseSequentialStream*) &CONSOLE, "Sample Length:%ld bytes\r\n", bytesToPlay);
 #endif
 
-	err = f_lseek(&f, HeaderLength);
-	if (err) {
-#if DEBUG
-		chprintf((BaseSequentialStream*) &CONSOLE, "Error set file position %s, error=%d\r\n", fpath, err);
-#endif
-		return;
-	}
-
+	codec_init(bitsPerSample);
 	playerThread = chThdCreateStatic(waPlayerThread, sizeof(waPlayerThread), PLAYER_PRIO, wavePlayerThread, NULL);
 }
 
@@ -245,6 +249,6 @@ void stopPlay(void) {
 	if (playerThread) {
 		chThdTerminate(playerThread);
 		chThdWait(playerThread);
-		playerThread=NULL;
+		if (chThdTerminatedX(playerThread))	playerThread=NULL;
 	}
 }

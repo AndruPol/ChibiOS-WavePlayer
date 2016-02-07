@@ -4,16 +4,14 @@
 
 #ifndef WAVEPLAYER_H_
 #define WAVEPLAYER_H_
+
+#include "ch.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "ch.h"
-#include "hal.h"
-
-#define PLAYER_PRIO		(NORMALPRIO+1)
-extern Thread* playerThread;
-extern EventSource player_evsrc;
+extern thread_t* playerThread;
 
 void playFile(char* fpath);
 void stopPlay(void);

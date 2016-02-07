@@ -251,14 +251,19 @@
 /*
  * USB bus activation macro, required by the USB driver.
  */
-#define usb_lld_connect_bus(usbp) palSetPadMode(GPIOA, GPIOA_USB_DP, PAL_MODE_INPUT);
+#define usb_lld_connect_bus(usbp) { \
+ palSetPadMode(GPIOA, GPIOA_USB_DP, PAL_MODE_INPUT); \
+ palSetPadMode(GPIOA, GPIOA_USB_DM, PAL_MODE_INPUT); \
+}
 
 /*
  * USB bus de-activation macro, required by the USB driver.
  */
 #define usb_lld_disconnect_bus(usbp) { \
  palSetPadMode(GPIOA, GPIOA_USB_DP, PAL_MODE_OUTPUT_PUSHPULL); \
+ palSetPadMode(GPIOA, GPIOA_USB_DM, PAL_MODE_OUTPUT_PUSHPULL); \
  palClearPad(GPIOA, GPIOA_USB_DP); \
+ palClearPad(GPIOA, GPIOA_USB_DM); \
 }
 
 #if !defined(_FROM_ASM_)

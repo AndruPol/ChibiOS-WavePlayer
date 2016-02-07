@@ -20,16 +20,64 @@
 #include "ff.h"
 #include "shell.h"
 #include "chprintf.h"
-#include "evtimer.h"
 #include "wave/wavePlayer.h"
-#include "drivers.h"
 
 #include <stdio.h>
 #include <string.h>
+
+#define CONSOLE			SD1
+
+#if defined(STM32F1XX_HD)
+#define LEDGPIO			GPIOC
+#define LEDPIN			GPIOC_LED
+#endif
+#if defined(STM32L1XX_MD)
+#define LEDGPIO			GPIOA
+#define LEDPIN			GPIOA_PIN15
+#endif
+
+/*===========================================================================*/
+/* MMC_SPI driver related settings.                                          */
+/*===========================================================================*/
+
+/**
+ * @brief   Delays insertions.
+ * @details If enabled this options inserts delays into the MMC waiting
+ *          routines releasing some extra CPU time for the threads with
+ *          lower priority, this may slow down the driver a bit however.
+ *          This option is recommended also if the SPI driver does not
+ *          use a DMA channel and heavily loads the CPU.
+ */
+#if !defined(MMC_NICE_WAITING) || defined(__DOXYGEN__)
+#define MMC_NICE_WAITING            TRUE
+#endif
+
+/**
+ * @brief   Number of positive insertion queries before generating the
+ *          insertion event.
+ */
+#if !defined(MMC_POLLING_INTERVAL) || defined(__DOXYGEN__)
+#define MMC_POLLING_INTERVAL        10
+#endif
+
+/**
+ * @brief   Interval, in milliseconds, between insertion queries.
+ */
+#if !defined(MMC_POLLING_DELAY) || defined(__DOXYGEN__)
+#define MMC_POLLING_DELAY           100
+#endif
+
+/**
+ * @brief   Block size for MMC transfers.
+ */
+#if !defined(MMC_SECTOR_SIZE) || defined(__DOXYGEN__)
+#define MMC_SECTOR_SIZE             512
+#endif
+
 /**
  * @brief   Card monitor timer.
  */
-static VirtualTimer tmr;
+static virtual_timer_t tmr;
 
 /**
  * @brief   Debounce counter.
@@ -39,7 +87,8 @@ static unsigned cnt;
 /**
  * @brief   Card event sources.
  */
-static EventSource inserted_event, removed_event;
+static EVENTSOURCE_DECL(inserted_event);
+static EVENTSOURCE_DECL(removed_event);
 
 /**
  * @brief   Insertion monitor timer callback function.
@@ -56,7 +105,7 @@ static void tmrfunc(void *p) {
      the pin connected to the CS/D3 contact of the card, this could disturb
      the transfer.*/
   blkstate_t state = blkGetDriverState(bbdp);
-  chSysLockFromIsr();
+  chSysLockFromISR();
   if ((state != BLK_READING) && (state != BLK_WRITING)) {
     /* Safe to perform the check.*/
     if (cnt > 0) {
@@ -76,7 +125,7 @@ static void tmrfunc(void *p) {
     }
   }
   chVTSetI(&tmr, MS2ST(MMC_POLLING_DELAY), tmrfunc, bbdp);
-  chSysUnlockFromIsr();
+  chSysUnlockFromISR();
 }
 
 /**
@@ -87,9 +136,6 @@ static void tmrfunc(void *p) {
  * @notapi
  */
 static void tmr_init(void *p) {
-
-  chEvtInit(&inserted_event);
-  chEvtInit(&removed_event);
   chSysLock();
   cnt = MMC_POLLING_INTERVAL;
   chVTSetI(&tmr, MS2ST(MMC_POLLING_DELAY), tmrfunc, p);
@@ -111,18 +157,16 @@ FATFS MMC_FS;
 MMCDriver MMCD1;
 
 /* FS mounted and ready.*/
-static bool_t fs_ready = FALSE;
+bool fs_ready = FALSE;
 
-static SPIConfig hs_spicfg = {NULL, GPIOB, GPIOB_PIN12, 0};
-
-static SPIConfig ls_spicfg = {NULL, GPIOB, GPIOB_PIN12,
-                              SPI_CR1_BR_2 | SPI_CR1_BR_1};
+static const SPIConfig hs_spicfg = {NULL, GPIOB, GPIOB_PIN12, 0};
+static const SPIConfig ls_spicfg = {NULL, GPIOB, GPIOB_PIN12, SPI_CR1_BR_2 | SPI_CR1_BR_1};
 
 /* MMC/SD over SPI driver configuration.*/
-static MMCConfig mmccfg = {&SPID2, &ls_spicfg, &hs_spicfg};
+static const MMCConfig mmccfg = {&SPID2, &ls_spicfg, &hs_spicfg};
 
 /* Generic large buffer.*/
-uint8_t fbuff[1024];
+uint8_t fbuff[256];
 
 static FRESULT scan_files(BaseSequentialStream *chp, char *path) {
   FRESULT res;
@@ -164,8 +208,7 @@ static FRESULT scan_files(BaseSequentialStream *chp, char *path) {
 /*===========================================================================*/
 /* Command line related.                                                     */
 /*===========================================================================*/
-
-#define SHELL_WA_SIZE   THD_WA_SIZE(2048)
+#define SHELL_WA_SIZE   THD_WORKING_AREA_SIZE(2048)
 
 static void cmd_mem(BaseSequentialStream *chp, int argc, char *argv[]) {
   size_t n, size;
@@ -176,14 +219,14 @@ static void cmd_mem(BaseSequentialStream *chp, int argc, char *argv[]) {
     return;
   }
   n = chHeapStatus(NULL, &size);
-  chprintf(chp, "core free memory : %u bytes\r\n", chCoreStatus());
+  chprintf(chp, "core free memory : %u bytes\r\n", chCoreGetStatusX());
   chprintf(chp, "heap fragments   : %u\r\n", n);
   chprintf(chp, "heap free total  : %u bytes\r\n", size);
 }
 
 static void cmd_threads(BaseSequentialStream *chp, int argc, char *argv[]) {
-  static const char *states[] = {THD_STATE_NAMES};
-  Thread *tp;
+  static const char *states[] = {CH_STATE_NAMES};
+  thread_t *tp;
 
   (void)argv;
   if (argc > 0) {
@@ -193,10 +236,10 @@ static void cmd_threads(BaseSequentialStream *chp, int argc, char *argv[]) {
   chprintf(chp, "    addr    stack prio refs     state time\r\n");
   tp = chRegFirstThread();
   do {
-    chprintf(chp, "%.8lx %.8lx %4lu %4lu %9s %lu\r\n",
+    chprintf(chp, "%08lx %08lx %4lu %4lu %9s\r\n",
             (uint32_t)tp, (uint32_t)tp->p_ctx.r13,
             (uint32_t)tp->p_prio, (uint32_t)(tp->p_refs - 1),
-            states[tp->p_state], (uint32_t)tp->p_time);
+            states[tp->p_state]);
     tp = chRegNextThread(tp);
   } while (tp != NULL);
 }
@@ -254,22 +297,21 @@ static const ShellCommand commands[] = {
 };
 
 static const ShellConfig shell_cfg = {
-  (BaseSequentialStream *)&SD2,
+  (BaseSequentialStream *)&CONSOLE,
   commands
 };
 
 /*
  * Red LEDs blinker thread, times are in milliseconds.
  */
-static WORKING_AREA(waledThread, 64);
-__attribute__((noreturn))
-static msg_t ledThread(void *arg) {
+static THD_WORKING_AREA(waledThread, 64);
+static THD_FUNCTION(ledThread, arg) {
   (void)arg;
   chRegSetThreadName("blinker");
-  palSetPadMode(GPIOC, GPIOC_LED, PAL_MODE_OUTPUT_PUSHPULL);
+  palSetPadMode(LEDGPIO, LEDPIN, PAL_MODE_OUTPUT_PUSHPULL);
 
   while (TRUE) {
-    palTogglePad(GPIOC, GPIOC_LED);
+    palTogglePad(LEDGPIO, LEDPIN);
     chThdSleepMilliseconds(500);
   }
 }
@@ -310,13 +352,13 @@ static void RemoveHandler(eventid_t id) {
  * Application entry point.
  */
 int main(void) {
-	static const evhandler_t evhndl[] = {
+	evhandler_t evhndl[] = {
 			  InsertHandler,
 			  RemoveHandler
 	};
 
-	static struct EventListener el0, el1;
-	Thread *shelltp = NULL;
+	struct event_listener el0, el1;
+	thread_t *shelltp = NULL;
 
    /*
    * System initializations.
@@ -326,25 +368,36 @@ int main(void) {
    *   RTOS is active.
    */
   halInit();
-  driversInit();
   chSysInit();
 
   /*
-   * Activates the serial driver 2 using the driver default configuration.
+   * Activates the serial driver 1 using the driver default configuration.
    */
-  sdStart(&SD2, NULL);
-  palSetPadMode(GPIOD, GPIOD_PIN5, PAL_MODE_STM32_ALTERNATE_PUSHPULL);
-  palSetPadMode(GPIOD, GPIOD_PIN6, PAL_MODE_INPUT);
-  AFIO->MAPR |= AFIO_MAPR_USART2_REMAP;
-
+  sdStart(&CONSOLE, NULL);
+#if defined(STM32F1XX_HD)
+  palSetPadMode(GPIOA, GPIOA_PIN9, PAL_MODE_STM32_ALTERNATE_PUSHPULL);
+  palSetPadMode(GPIOA, GPIOA_PIN10, PAL_MODE_INPUT);
+#endif
+#if defined(STM32L1XX_MD)
+  palSetPadMode(GPIOA, GPIOA_PIN9, PAL_MODE_ALTERNATE(7));
+  palSetPadMode(GPIOA, GPIOA_PIN10, PAL_MODE_ALTERNATE(7));
+#endif
   /*
    * Initializes the MMC driver to work with SPI2.
    */
   // setup pads to SPI2 function (connect these pads to your SD card accordingly)
+#if defined(STM32F1XX_HD)
   palSetPadMode(GPIOB, GPIOB_PIN12, PAL_MODE_OUTPUT_PUSHPULL); // CS
   palSetPadMode(GPIOB, GPIOB_PIN13, PAL_MODE_STM32_ALTERNATE_PUSHPULL); // SCK
   palSetPadMode(GPIOB, GPIOB_PIN14, PAL_MODE_STM32_ALTERNATE_PUSHPULL); // MISO
   palSetPadMode(GPIOB, GPIOB_PIN15, PAL_MODE_STM32_ALTERNATE_PUSHPULL); // MOSI
+#endif
+#if defined(STM32L1XX_MD)
+  palSetPadMode(GPIOB, GPIOB_PIN12, PAL_MODE_OUTPUT_PUSHPULL | PAL_STM32_OSPEED_HIGHEST); // CS
+  palSetPadMode(GPIOB, GPIOB_PIN13, PAL_MODE_ALTERNATE(5) | PAL_STM32_OSPEED_HIGHEST); // SCK
+  palSetPadMode(GPIOB, GPIOB_PIN14, PAL_MODE_ALTERNATE(5) | PAL_STM32_OSPEED_HIGHEST); // MISO
+  palSetPadMode(GPIOB, GPIOB_PIN15, PAL_MODE_ALTERNATE(5) | PAL_STM32_OSPEED_HIGHEST); // MOSI
+#endif
   palSetPad(GPIOB, GPIOB_PIN12); // set CS high
 
   mmcObjectInit(&MMCD1);
@@ -374,7 +427,7 @@ int main(void) {
   while (TRUE) {
     if (!shelltp)
       shelltp = shellCreate(&shell_cfg, SHELL_WA_SIZE, NORMALPRIO);
-    else if (chThdTerminated(shelltp)) {
+    else if (chThdTerminatedX(shelltp)) {
       chThdRelease(shelltp);    /* Recovers memory of the previous shell.   */
       shelltp = NULL;           /* Triggers spawning of a new shell.        */
     }

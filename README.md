@@ -1,2 +1,4 @@
 # ChibiOS-WavePlayer
-Simple wave player using STM32F103 internal DAC &amp; MMC/SPI driver. It's using ChibiOS 2.6 and ChibiOS-Drivers project.
+ChibiOS/RT 3.x simple wave player on stm32l152/stm32f103 platform using the integrated DAC and MMS/SPI driver.
+
+Tested on STM32L152RBT6 only.
